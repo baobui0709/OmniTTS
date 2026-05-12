@@ -19,12 +19,21 @@ Gradio demo for OmniVoice.
 
 Supports voice cloning and voice design.
 
+Changes in this version:
+- Default model changed to StevenLewis79/OmniVoice.
+- Added in-memory cache for encoded voice clone prompts.
+- Added optional fixed voice prompt preloading via --fixed-ref-audio.
+
 Usage:
     omnivoice-demo --model /path/to/checkpoint --port 8000
+    omnivoice-demo --fixed-ref-audio assets/main_voice.wav --fixed-ref-text "..." --share
 """
 
 import argparse
+import hashlib
 import logging
+import threading
+from collections import OrderedDict
 from typing import Any, Dict
 
 import gradio as gr
@@ -105,6 +114,7 @@ _ATTR_INFO = {
     "Chinese Dialect / 中文方言": "Only effective for Chinese speech.",
 }
 
+
 # ---------------------------------------------------------------------------
 # Argument parser
 # ---------------------------------------------------------------------------
@@ -149,6 +159,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="ASR model path or HuggingFace repo id"
         " (default: openai/whisper-large-v3-turbo).",
     )
+    parser.add_argument(
+        "--fixed-ref-audio",
+        default=None,
+        help=(
+            "Path to a fixed reference audio. If set, this voice is encoded once "
+            "at startup and reused for all Voice Clone requests."
+        ),
+    )
+    parser.add_argument(
+        "--fixed-ref-text",
+        default=None,
+        help=(
+            "Transcript of the fixed reference audio. Recommended for faster startup "
+            "and more stable cloning. If omitted, ASR is used when available."
+        ),
+    )
+    parser.add_argument(
+        "--voice-cache-size",
+        type=int,
+        default=8,
+        help="Max number of uploaded reference voices to keep in memory cache.",
+    )
     return parser
 
 
@@ -161,9 +193,55 @@ def build_demo(
     model: OmniVoice,
     checkpoint: str,
     generate_fn=None,
+    fixed_voice_prompt=None,
+    voice_cache_size: int = 8,
 ) -> gr.Blocks:
 
     sampling_rate = model.sampling_rate
+
+    # Cache encoded voice prompts to avoid re-encoding the same reference audio.
+    # This cache lives only while the Gradio process is running.
+    voice_prompt_cache = OrderedDict()
+    voice_prompt_cache_lock = threading.Lock()
+    voice_prompt_cache_max_size = max(1, int(voice_cache_size or 8))
+
+    def _file_sha256(path: str) -> str:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    def _get_cached_voice_prompt(ref_audio, ref_text=None, preprocess_prompt=True):
+        """Return cached VoiceClonePrompt for the same audio/text/preprocess combo."""
+        if not isinstance(ref_audio, str):
+            # gr.Audio(type="filepath") normally returns a string path.
+            # This fallback keeps the app robust for unusual input types.
+            key_audio = str(id(ref_audio))
+        else:
+            key_audio = _file_sha256(ref_audio)
+
+        key = (key_audio, ref_text or "", bool(preprocess_prompt))
+
+        with voice_prompt_cache_lock:
+            cached = voice_prompt_cache.get(key)
+            if cached is not None:
+                voice_prompt_cache.move_to_end(key)
+                return cached, True
+
+            prompt = model.create_voice_clone_prompt(
+                ref_audio=ref_audio,
+                ref_text=ref_text,
+                preprocess_prompt=bool(preprocess_prompt),
+            )
+
+            voice_prompt_cache[key] = prompt
+            voice_prompt_cache.move_to_end(key)
+
+            while len(voice_prompt_cache) > voice_prompt_cache_max_size:
+                voice_prompt_cache.popitem(last=False)
+
+            return prompt, False
 
     # -- shared generation core --
     def _gen_core(
@@ -203,13 +281,23 @@ def build_demo(
         if duration is not None and float(duration) > 0:
             kw["duration"] = float(duration)
 
+        voice_cache_status = ""
+
         if mode == "clone":
-            if not ref_audio:
-                return None, "Please upload a reference audio."
-            kw["voice_clone_prompt"] = model.create_voice_clone_prompt(
-                ref_audio=ref_audio,
-                ref_text=ref_text,
-            )
+            if fixed_voice_prompt is not None:
+                kw["voice_clone_prompt"] = fixed_voice_prompt
+                voice_cache_status = "fixed voice"
+            else:
+                if not ref_audio:
+                    return None, "Please upload a reference audio."
+
+                voice_prompt, cache_hit = _get_cached_voice_prompt(
+                    ref_audio=ref_audio,
+                    ref_text=ref_text,
+                    preprocess_prompt=preprocess_prompt,
+                )
+                kw["voice_clone_prompt"] = voice_prompt
+                voice_cache_status = "cache hit" if cache_hit else "cache miss"
 
         if instruct and instruct.strip():
             kw["instruct"] = instruct.strip()
@@ -220,6 +308,8 @@ def build_demo(
             return None, f"Error: {type(e).__name__}: {e}"
 
         waveform = (audio[0] * 32767).astype(np.int16)
+        if voice_cache_status:
+            return (sampling_rate, waveform), f"Done. Voice prompt: {voice_cache_status}."
         return (sampling_rate, waveform), "Done."
 
     # Allow external wrappers (e.g. spaces.GPU for ZeroGPU Spaces)
@@ -313,6 +403,9 @@ State-of-the-art text-to-speech model for **600+ languages**, supporting:
 - **Voice Clone** — Clone any voice from a reference audio
 - **Voice Design** — Create custom voices with speaker attributes
 
+This build includes voice prompt caching. If `--fixed-ref-audio` is used,
+the fixed voice is encoded once at startup and reused for every clone request.
+
 Built with [OmniVoice](https://github.com/k2-fsa/OmniVoice)
 by Xiaomi AI Lab Next-gen Kaldi team.
 """
@@ -338,6 +431,7 @@ by Xiaomi AI Lab Next-gen Kaldi team.
                         gr.Markdown(
                             "<span style='font-size:0.85em;color:#888;'>"
                             "Recommended: 3–10 seconds audio. "
+                            "If fixed voice mode is enabled, this upload is ignored."
                             "</span>"
                         )
                         vc_ref_text = gr.Textbox(
@@ -523,6 +617,7 @@ def main(argv=None) -> int:
     if not checkpoint:
         parser.print_help()
         return 0
+
     logging.info(f"Loading model from {checkpoint}, device={device} ...")
     model = OmniVoice.from_pretrained(
         checkpoint,
@@ -533,7 +628,22 @@ def main(argv=None) -> int:
     )
     print("Model loaded.")
 
-    demo = build_demo(model, checkpoint)
+    fixed_voice_prompt = None
+    if args.fixed_ref_audio:
+        logging.info(f"Encoding fixed voice prompt from {args.fixed_ref_audio} ...")
+        fixed_voice_prompt = model.create_voice_clone_prompt(
+            ref_audio=args.fixed_ref_audio,
+            ref_text=args.fixed_ref_text,
+            preprocess_prompt=True,
+        )
+        logging.info("Fixed voice prompt encoded.")
+
+    demo = build_demo(
+        model,
+        checkpoint,
+        fixed_voice_prompt=fixed_voice_prompt,
+        voice_cache_size=args.voice_cache_size,
+    )
 
     demo.queue().launch(
         server_name=args.ip,
