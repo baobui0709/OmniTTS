@@ -71,7 +71,7 @@ def get_parser():
     parser.add_argument(
         "--model",
         type=str,
-        default="k2-fsa/OmniVoice",
+        default="StevenLewis79/OmniVoice",
         help="Path to the model checkpoint (local dir or HF repo id). "
         "Audio tokenizer is expected at <checkpoint>/audio_tokenizer/.",
     )
