@@ -212,28 +212,42 @@ def build_demo(
                 h.update(chunk)
         return h.hexdigest()
 
-    def _get_cached_voice_prompt(ref_audio, ref_text=None, preprocess_prompt=True):
-        """Return cached VoiceClonePrompt for the same audio/text/preprocess combo."""
+        def _get_cached_voice_prompt(ref_audio, ref_text=None, preprocess_prompt=True):
+        """Return cached VoiceClonePrompt.
+
+        Non-blocking design:
+        - Do not hold the global cache lock while encoding voice.
+        - This keeps concurrent Gradio requests smooth.
+        - In the first burst, multiple requests may encode the same voice once.
+        - After cache is populated, later requests will be cache hit.
+        """
         if not isinstance(ref_audio, str):
-            # gr.Audio(type="filepath") normally returns a string path.
-            # This fallback keeps the app robust for unusual input types.
             key_audio = str(id(ref_audio))
         else:
             key_audio = _file_sha256(ref_audio)
 
         key = (key_audio, ref_text or "", bool(preprocess_prompt))
 
+        # Fast cache read.
         with voice_prompt_cache_lock:
             cached = voice_prompt_cache.get(key)
             if cached is not None:
                 voice_prompt_cache.move_to_end(key)
                 return cached, True
 
-            prompt = model.create_voice_clone_prompt(
-                ref_audio=ref_audio,
-                ref_text=ref_text,
-                preprocess_prompt=bool(preprocess_prompt),
-            )
+        # Important: encode OUTSIDE the lock to avoid blocking concurrent requests.
+        prompt = model.create_voice_clone_prompt(
+            ref_audio=ref_audio,
+            ref_text=ref_text,
+            preprocess_prompt=bool(preprocess_prompt),
+        )
+
+        # Write cache. Another request may have inserted the same key while we encoded.
+        with voice_prompt_cache_lock:
+            cached = voice_prompt_cache.get(key)
+            if cached is not None:
+                voice_prompt_cache.move_to_end(key)
+                return cached, True
 
             voice_prompt_cache[key] = prompt
             voice_prompt_cache.move_to_end(key)
