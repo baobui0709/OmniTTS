@@ -15,7 +15,7 @@ Usage:
         --instruct "male, British accent" --output out.wav
 
     # Auto voice
-    omnivoice-infer --model k2-fsa/OmniVoice \
+    -infer --model k2-fsa/OmniVoice \
         --text "Hello, this is a text for text-to-speech." --output out.wav
 """
 
@@ -41,13 +41,13 @@ def get_best_device():
 
 def get_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="OmniVoice single-item inference",
+        description=" single-item inference",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
         "--model",
         type=str,
-        default="k2-fsa/OmniVoice",
+        default="StevenLewis79/OmniVoice",
         help="Model checkpoint path or HuggingFace repo id.",
     )
     parser.add_argument(
