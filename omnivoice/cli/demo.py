@@ -21,7 +21,7 @@ Supports voice cloning and voice design.
 
 Changes in this version:
 - Default model changed to StevenLewis79/OmniVoice.
-- Added in-memory cache for encoded voice clone prompts.
+- Added non-blocking in-memory cache for encoded voice clone prompts.
 - Added optional fixed voice prompt preloading via --fixed-ref-audio.
 
 Usage:
@@ -201,6 +201,10 @@ def build_demo(
 
     # Cache encoded voice prompts to avoid re-encoding the same reference audio.
     # This cache lives only while the Gradio process is running.
+    # Non-blocking behavior: do not hold the lock while model.create_voice_clone_prompt()
+    # is running. This keeps concurrent requests from stalling. In the first burst,
+    # a few concurrent requests may encode the same voice in parallel; after that,
+    # cache hits will be used.
     voice_prompt_cache = OrderedDict()
     voice_prompt_cache_lock = threading.Lock()
     voice_prompt_cache_max_size = max(1, int(voice_cache_size or 8))
@@ -212,37 +216,36 @@ def build_demo(
                 h.update(chunk)
         return h.hexdigest()
 
-        def _get_cached_voice_prompt(ref_audio, ref_text=None, preprocess_prompt=True):
-        """Return cached VoiceClonePrompt.
+    def _get_cached_voice_prompt(ref_audio, ref_text=None, preprocess_prompt=True):
+        """Return cached VoiceClonePrompt for the same audio/text/preprocess combo.
 
-        Non-blocking design:
-        - Do not hold the global cache lock while encoding voice.
-        - This keeps concurrent Gradio requests smooth.
-        - In the first burst, multiple requests may encode the same voice once.
-        - After cache is populated, later requests will be cache hit.
+        This function intentionally performs voice encoding outside the lock.
+        That avoids blocking a connection pool with many concurrent requests.
         """
         if not isinstance(ref_audio, str):
+            # gr.Audio(type="filepath") normally returns a string path.
+            # This fallback keeps the app robust for unusual input types.
             key_audio = str(id(ref_audio))
         else:
             key_audio = _file_sha256(ref_audio)
 
         key = (key_audio, ref_text or "", bool(preprocess_prompt))
 
-        # Fast cache read.
+        # Short lock for cache read only.
         with voice_prompt_cache_lock:
             cached = voice_prompt_cache.get(key)
             if cached is not None:
                 voice_prompt_cache.move_to_end(key)
                 return cached, True
 
-        # Important: encode OUTSIDE the lock to avoid blocking concurrent requests.
+        # Important: encode outside the lock to keep concurrent requests flowing.
         prompt = model.create_voice_clone_prompt(
             ref_audio=ref_audio,
             ref_text=ref_text,
             preprocess_prompt=bool(preprocess_prompt),
         )
 
-        # Write cache. Another request may have inserted the same key while we encoded.
+        # Short lock for cache write only. Another request may already have inserted it.
         with voice_prompt_cache_lock:
             cached = voice_prompt_cache.get(key)
             if cached is not None:
@@ -417,8 +420,9 @@ State-of-the-art text-to-speech model for **600+ languages**, supporting:
 - **Voice Clone** — Clone any voice from a reference audio
 - **Voice Design** — Create custom voices with speaker attributes
 
-This build includes voice prompt caching. If `--fixed-ref-audio` is used,
-the fixed voice is encoded once at startup and reused for every clone request.
+This build includes non-blocking voice prompt caching.
+If `--fixed-ref-audio` is used, the fixed voice is encoded once at startup
+and reused for every clone request.
 
 Built with [OmniVoice](https://github.com/k2-fsa/OmniVoice)
 by Xiaomi AI Lab Next-gen Kaldi team.
